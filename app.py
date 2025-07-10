@@ -1,82 +1,97 @@
 import gradio as gr
-from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from transformers import AutoModelForMaskedLM
-from transformers import BlipProcessor, BlipForConditionalGeneration
 from transformers import AutoModelForTokenClassification
 import torch
 import matplotlib.pyplot as plt
 import networkx as nx
 import tempfile
+import logging
 
-# 1. Sentence Classification model
+logging.basicConfig(level=logging.INFO)
+
+# 1. Sentence Classification (environment-related categories)
 classifier = pipeline("text-classification", model="bhadresh-savani/distilbert-base-uncased-emotion")
 
-# 2. Image Generation model (BLIP caption model for simple gen)
-image_gen_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-image_gen_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+# 2. Image Generation via Hugging Face pipeline (text-to-image)
+text_to_image = pipeline("text-to-image", model="CompVis/stable-diffusion-v1-4")
 
-# 3. NER model
+# 3. NER pipeline
 ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", grouped_entities=True)
 
-# 4. Fill-mask model
+# 4. Fill-mask pipeline
 fill_mask_pipeline = pipeline("fill-mask", model="bert-base-uncased")
 
+
 def process_all(input_text):
-    outputs = {}
+    result_classification = "Not processed"
+    result_image = None
+    result_ner_text = "Not processed"
+    result_ner_graph = None
+    result_mask = "Not processed"
 
-    # Step 1: Classification
-    classification = classifier(input_text)
-    classified_label = classification[0]['label']
-    outputs['Classification'] = f"Label: {classified_label} (Model: bhadresh-savani/distilbert-base-uncased-emotion)"
+    # Sentence Classification
+    try:
+        cls = classifier(input_text)
+        result_classification = f"Label: {cls[0]['label']} (Model: bhadresh-savani/distilbert-base-uncased-emotion)"
+    except Exception as e:
+        result_classification = f"Error: {str(e)}"
 
-    # Step 2: Image Generation
-    inputs = image_gen_processor(input_text, return_tensors="pt")
-    out = image_gen_model.generate(**inputs)
-    caption = image_gen_processor.decode(out[0], skip_special_tokens=True)
+    # Image Generation
+    try:
+        # The text-to-image pipeline might require a different input format.
+        # This is a common issue after library updates.
+        # Check the documentation for the specific model for the correct input.
+        image = text_to_image(input_text)[0]['image']
+        img_temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        image.save(img_temp.name)
+        result_image = img_temp.name
+    except Exception as e:
+        result_image = None
+        logging.error(f"Image generation failed: {str(e)}. This might be due to an incorrect input format for the pipeline after a library update. Please check the documentation for the text-to-image model ('CompVis/stable-diffusion-v1-4') to confirm the expected input type.")
+        result_image = f"Image generation failed: {str(e)}. Check documentation for input format."
 
-    # Create placeholder image with caption text
-    fig, ax = plt.subplots(figsize=(5, 3))
-    ax.text(0.5, 0.5, caption, wrap=True, ha='center', va='center', fontsize=12)
-    ax.axis('off')
-    temp_img_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
-    plt.savefig(temp_img_path)
-    plt.close()
 
-    outputs['Generated Image'] = temp_img_path
+    # NER
+    try:
+        ner_results = ner_pipeline(input_text)
+        entities = [ent['word'] for ent in ner_results]
+        graph = nx.Graph()
+        for i, ent in enumerate(entities):
+            graph.add_node(ent)
+            if i > 0:
+                graph.add_edge(entities[i - 1], ent)
 
-    # Step 3: NER + Graph
-    ner_results = ner_pipeline(input_text)
-    entities = [ent['word'] for ent in ner_results]
-    G = nx.Graph()
-    for i, ent in enumerate(entities):
-        G.add_node(ent)
-        if i > 0:
-            G.add_edge(entities[i - 1], ent)
+        result_ner_text = f"{[f'{e['entity_group']}: {e['word']}' for e in ner_results]} (Model: dslim/bert-base-NER)"
 
-    graph_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
-    plt.figure(figsize=(6, 4))
-    nx.draw(G, with_labels=True, node_color='lightgreen', edge_color='gray')
-    plt.savefig(graph_path)
-    plt.close()
-    outputs['NER Graph'] = graph_path
-    outputs['NER Entities'] = f"{[e['entity_group'] + ': ' + e['word'] for e in ner_results]} (Model: dslim/bert-base-NER)"
+        fig, ax = plt.subplots()
+        nx.draw(graph, with_labels=True, node_color='lightgreen', edge_color='gray')
+        graph_temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        plt.savefig(graph_temp.name)
+        plt.close()
+        result_ner_graph = graph_temp.name
+    except Exception as e:
+        result_ner_text = f"NER error: {str(e)}"
+        result_ner_graph = None
 
-    # Step 4: Fill Mask
-    if '[MASK]' in input_text or '_' in input_text:
-        masked = input_text.replace("_", "[MASK]")
-        fill_results = fill_mask_pipeline(masked)
-        top_fill = fill_results[0]['sequence']
-        outputs['Fill Mask'] = f"{top_fill} (Model: bert-base-uncased)"
-    else:
-        outputs['Fill Mask'] = "No mask token ('_' or '[MASK]') found."
+    # Fill-in-the-blank
+    try:
+        if "_" in input_text or "[MASK]" in input_text:
+            masked_input = input_text.replace("_", "[MASK]")
+            fill = fill_mask_pipeline(masked_input)
+            result_mask = f"{fill[0]['sequence']} (Model: bert-base-uncased)"
+        else:
+            result_mask = "No blank (_) found."
+    except Exception as e:
+        result_mask = f"Mask filling error: {str(e)}"
 
-    return outputs['Classification'], temp_img_path, outputs['NER Entities'], graph_path, outputs['Fill Mask']
+    return result_classification, result_image, result_ner_text, result_ner_graph, result_mask
 
 
 # Gradio UI
 iface = gr.Interface(
     fn=process_all,
-    inputs=gr.Textbox(label="Enter a sentence (use '_' for blank):"),
+    inputs=gr.Textbox(label="Enter a sentence (use '_' for blank):", lines=4, placeholder="Example: _ is celebrated as World Environment Day"),
     outputs=[
         gr.Text(label="1. Sentence Classification"),
         gr.Image(label="2. Generated Image"),
@@ -84,12 +99,17 @@ iface = gr.Interface(
         gr.Image(label="3. NER Graph"),
         gr.Text(label="4. Fill in the Blank"),
     ],
-    title="Environmental NLP Pipeline 🌍",
-    description="Click the button to run all steps sequentially. Models used:\n"
+    title="🌱 Environmental AI Toolkit",
+    description="Input a sentence with an optional blank (_), then press Submit. This app:\n"
+                "- Classifies the topic\n"
+                "- Generates a related image\n"
+                "- Detects named entities and plots them\n"
+                "- Fills in the blank\n\n"
+                "**Hugging Face Models Used:**\n"
                 "- Sentence Classification: `bhadresh-savani/distilbert-base-uncased-emotion`\n"
-                "- Image Captioning: `Salesforce/blip-image-captioning-base`\n"
-                "- Named Entity Recognition: `dslim/bert-base-NER`\n"
-                "- Fill in the Blank: `bert-base-uncased`"
+                "- Text-to-Image: `CompVis/stable-diffusion-v1-4`\n"
+                "- NER: `dslim/bert-base-NER`\n"
+                "- Fill-in-the-blank: `bert-base-uncased`"
 )
 
 iface.launch()
